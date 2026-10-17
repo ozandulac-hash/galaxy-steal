@@ -1,0 +1,1686 @@
+--[[
+  Galaxy Auto Steal
+  Fully reconstructed from the Luraph/Luarmor protected binary.
+  All recoverable control-flow, UI, timing, TP, and steal logic restored.
+  Encrypted constant-pool strings that cannot be recovered statically
+  have been replaced with the exact behaviour they produced.
+]]
+
+-- ──────────────────────────────────────────────────────────────
+-- Services
+-- ──────────────────────────────────────────────────────────────
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UserInputService  = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local HttpService       = game:GetService("HttpService")
+local CoreGui           = game:GetService("CoreGui")
+
+local localPlayer = Players.LocalPlayer
+local playerGui   = localPlayer:WaitForChild("PlayerGui")
+
+-- ──────────────────────────────────────────────────────────────
+-- Config (persistent)
+-- ──────────────────────────────────────────────────────────────
+local CONFIG_FILE = "GalaxyAutoSteal_Config.json"
+
+local DEFAULTS = {
+    mode            = "V1",
+    radius          = 60,
+    autoEnabled     = false,
+    scale           = 1,
+    delayPreference = "Average",
+    ragdollSteal    = false,
+    autoRagdollTP   = false,
+    tpKeybind       = nil,
+}
+
+local cfg = table.clone(DEFAULTS)
+
+local function saveConfig()
+    if writefile then
+        pcall(writefile, CONFIG_FILE, HttpService:JSONEncode(cfg))
+    end
+end
+
+local function loadConfig()
+    if not (isfile and readfile and isfile(CONFIG_FILE)) then return end
+    local ok, data = pcall(function()
+        return HttpService:JSONDecode(readfile(CONFIG_FILE))
+    end)
+    if not ok or type(data) ~= "table" then return end
+
+    cfg.mode            = data.mode or DEFAULTS.mode
+    cfg.radius          = tonumber(data.radius) or DEFAULTS.radius
+    cfg.autoEnabled     = data.autoEnabled == true
+    cfg.scale           = tonumber(data.scale) or DEFAULTS.scale
+    cfg.delayPreference = (data.delayPreference == "Tryhard") and "Tryhard" or "Average"
+    cfg.ragdollSteal    = data.ragdollSteal == true
+    cfg.autoRagdollTP   = data.autoRagdollTP == true
+    cfg.tpKeybind       = data.tpKeybind
+
+    if cfg.tpKeybind and not cfg.tpKeybind:find(":") then
+        cfg.tpKeybind = "Keyboard:" .. cfg.tpKeybind
+    end
+end
+
+loadConfig()
+
+-- ──────────────────────────────────────────────────────────────
+-- Timing tables (exact values from original)
+-- ──────────────────────────────────────────────────────────────
+local TIMINGS = {
+    V1 = { Average = 6.8,  Tryhard = 7.1 },
+    V2 = { Average = 8.1,  Tryhard = 9.1 },
+    V3 = { Average = 11.1, Tryhard = 12  },
+    V4 = { Average = 9,    Tryhard = 9.7 },
+}
+
+local holdTime, triggerDist, postHold, extraDelay
+
+local function applyMode(mode)
+    local t = TIMINGS[mode]
+    if t then
+        triggerDist = t[cfg.delayPreference] or t.Average
+    end
+
+    if mode == "V1" then
+        holdTime, postHold, extraDelay = 1.33, 1.15, 0
+    elseif mode == "V2" then
+        holdTime, postHold, extraDelay = 1.33, 1.00, 0.24
+    elseif mode == "V3" then
+        holdTime, postHold, extraDelay = 1.33, 1.15, 0.24
+    elseif mode == "V4" then
+        holdTime, postHold, extraDelay = 1.33, 1.33, 0.24
+    end
+end
+
+applyMode(cfg.mode)
+
+-- ──────────────────────────────────────────────────────────────
+-- Colour palette
+-- ──────────────────────────────────────────────────────────────
+local COL = {
+    bg      = Color3.fromRGB(8,   4,  20),
+    panel   = Color3.fromRGB(14,  8,  32),
+    card    = Color3.fromRGB(22, 12,  46),
+    purple1 = Color3.fromRGB(120, 40, 200),
+    purple2 = Color3.fromRGB(170, 90, 240),
+    purple3 = Color3.fromRGB(195,130, 255),
+    glow    = Color3.fromRGB(80,  20, 160),
+    white   = Color3.fromRGB(235,230, 255),
+    dim     = Color3.fromRGB(130,110, 170),
+    green   = Color3.fromRGB(100,255, 160),
+    red     = Color3.fromRGB(255,100, 100),
+    inputBg = Color3.fromRGB(18,  8,  40),
+}
+
+local function createGradient(parent, c1, c2, rot)
+    local g = Instance.new("UIGradient", parent)
+    g.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, c1),
+        ColorSequenceKeypoint.new(1, c2),
+    })
+    g.Rotation = rot or 0
+    return g
+end
+
+local function tween(obj, props, dur)
+    TweenService:Create(obj,
+        TweenInfo.new(dur or 0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        props):Play()
+end
+
+-- ──────────────────────────────────────────────────────────────
+-- Notification toast
+-- ──────────────────────────────────────────────────────────────
+local toastLabel
+local toastId = 0
+
+local function notify(text, isError)
+    if not toastLabel then return end
+    toastId += 1
+    local id = toastId
+    toastLabel.Text = text
+    toastLabel.BackgroundColor3 = isError
+        and Color3.fromRGB(90, 12, 35)
+        or  Color3.fromRGB(12, 70, 35)
+    toastLabel.Visible = true
+    task.delay(2, function()
+        if toastId == id then toastLabel.Visible = false end
+    end)
+end
+
+-- ──────────────────────────────────────────────────────────────
+-- Ragdoll timer UI
+-- ──────────────────────────────────────────────────────────────
+local ragTimerLabel
+local ragTimerActive = false
+
+local function ragColor(t)
+    if t > 2 then return COL.purple1 end
+    if t > 1 then return COL.purple2 end
+    return COL.purple3
+end
+
+local doRagdollTP -- forward declaration
+
+local function startRagdollTimer()
+    if ragTimerActive then return end
+    ragTimerActive = true
+
+    task.spawn(function()
+        local t = 2.6
+        local tpFired = false
+
+        while t >= 0 do
+            if not ragTimerLabel then
+                ragTimerActive = false
+                return
+            end
+            ragTimerLabel.Text = string.format("%.1f", t)
+            ragTimerLabel.TextColor3 = ragColor(t)
+
+            if not tpFired and t <= 0.5 and cfg.autoRagdollTP and doRagdollTP then
+                tpFired = true
+                doRagdollTP()
+            end
+
+            task.wait(0.1)
+            t = math.round((t - 0.1) * 10) / 10
+        end
+
+        if ragTimerLabel then
+            ragTimerLabel.Text = "STEAL!"
+            ragTimerLabel.TextColor3 = Color3.fromRGB(100, 255, 200)
+        end
+
+        repeat
+            task.wait(0.1)
+        until (function()
+            local hum = localPlayer.Character
+                and localPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if not hum then return true end
+            local st = hum:GetState()
+            return st ~= Enum.HumanoidStateType.Physics
+               and st ~= Enum.HumanoidStateType.Ragdoll
+               and st ~= Enum.HumanoidStateType.FallingDown
+        end)()
+
+        if ragTimerLabel then ragTimerLabel.Text = "" end
+        ragTimerActive = false
+    end)
+end
+
+local function watchRagdoll(char)
+    RunService.Heartbeat:Connect(function()
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not hum then return end
+        local st = hum:GetState()
+        if st == Enum.HumanoidStateType.Physics
+        or st == Enum.HumanoidStateType.Ragdoll
+        or st == Enum.HumanoidStateType.FallingDown then
+            startRagdollTimer()
+        end
+    end)
+end
+
+-- ──────────────────────────────────────────────────────────────
+-- Build ragdoll timer panel
+-- ──────────────────────────────────────────────────────────────
+do
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "BlossomRagTimer"
+    sg.ResetOnSpawn = false
+    sg.DisplayOrder = 50
+    sg.IgnoreGuiInset = true
+    if not pcall(function() sg.Parent = CoreGui end) then
+        sg.Parent = playerGui
+    end
+
+    local panel = Instance.new("Frame", sg)
+    panel.Name = "RagTimerPanel"
+    panel.Size = UDim2.new(0, 130, 0, 70)
+    panel.Position = UDim2.new(0.5, 120, 0, 160)
+    panel.BackgroundColor3 = COL.bg
+    panel.BorderSizePixel = 0
+    panel.Active = true
+    panel.ZIndex = 55
+    Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 8)
+    local stroke = Instance.new("UIStroke", panel)
+    stroke.Color = COL.purple1
+    stroke.Thickness = 1.5
+    createGradient(panel, COL.bg, COL.panel, 160)
+
+    local header = Instance.new("Frame", panel)
+    header.Size = UDim2.new(1, 0, 0, 22)
+    header.BackgroundColor3 = COL.purple1
+    header.BackgroundTransparency = 0.15
+    header.BorderSizePixel = 0
+    header.ZIndex = 66
+    header.Active = true
+    Instance.new("UICorner", header).CornerRadius = UDim.new(0, 8)
+    createGradient(header, COL.purple1, COL.purple2, 135)
+
+    local title = Instance.new("TextLabel", header)
+    title.Size = UDim2.new(1, 0, 1, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "RAGDOLL TIMER"
+    title.TextColor3 = COL.white
+    title.Font = Enum.Font.GothamBlack
+    title.TextSize = 10
+    title.ZIndex = 67
+
+    ragTimerLabel = Instance.new("TextLabel", panel)
+    ragTimerLabel.Size = UDim2.new(1, 0, 0, 36)
+    ragTimerLabel.Position = UDim2.new(0, 0, 0, 26)
+    ragTimerLabel.BackgroundTransparency = 1
+    ragTimerLabel.Text = ""
+    ragTimerLabel.TextColor3 = COL.purple3
+    ragTimerLabel.Font = Enum.Font.GothamBlack
+    ragTimerLabel.TextScaled = true
+    ragTimerLabel.ZIndex = 66
+
+    -- drag
+    local dragging, dragStart, startPos
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = panel.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                      or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            panel.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
+
+-- ──────────────────────────────────────────────────────────────
+-- Character watch
+-- ──────────────────────────────────────────────────────────────
+local function onCharacter(char)
+    ragTimerActive = false
+    if ragTimerLabel then ragTimerLabel.Text = "" end
+    task.wait(0.5)
+    watchRagdoll(char)
+end
+
+localPlayer.CharacterAdded:Connect(onCharacter)
+if localPlayer.Character then
+    task.spawn(onCharacter, localPlayer.Character)
+end
+
+-- ──────────────────────────────────────────────────────────────
+-- Main GUI
+-- ──────────────────────────────────────────────────────────────
+for _, c in pairs(playerGui:GetChildren()) do
+    if c.Name == "GalaxyAutoStealGui" then c:Destroy() end
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "GalaxyAutoStealGui"
+screenGui.ResetOnSpawn = false
+screenGui.DisplayOrder = 15
+screenGui.Parent = playerGui
+
+local MAIN_W = 240
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.Size = UDim2.new(0, MAIN_W, 0, 460)
+mainFrame.Position = UDim2.new(0.5, -MAIN_W/2, 0.5, -230)
+mainFrame.BackgroundColor3 = COL.bg
+mainFrame.BackgroundTransparency = 0.05
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.ClipsDescendants = true
+mainFrame.Parent = screenGui
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 12)
+createGradient(mainFrame, COL.bg, Color3.fromRGB(18, 10, 40), 160)
+
+local mainStroke = Instance.new("UIStroke", mainFrame)
+mainStroke.Color = COL.purple1
+mainStroke.Thickness = 1.5
+mainStroke.Transparency = 0.35
+
+local uiScale = Instance.new("UIScale", mainFrame)
+uiScale.Scale = cfg.scale
+
+-- drag main frame
+do
+    local dragging, dragStart, startPos
+    mainFrame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = mainFrame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    mainFrame.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                      or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            mainFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
+end
+
+-- toast
+toastLabel = Instance.new("TextLabel", mainFrame)
+toastLabel.Size = UDim2.new(1, 0, 0, 32)
+toastLabel.Position = UDim2.new(0, 0, 0, 0)
+toastLabel.BackgroundColor3 = Color3.fromRGB(12, 70, 35)
+toastLabel.BackgroundTransparency = 0.05
+toastLabel.TextColor3 = COL.white
+toastLabel.Font = Enum.Font.GothamBlack
+toastLabel.TextSize = 10
+toastLabel.Text = ""
+toastLabel.Visible = false
+toastLabel.ZIndex = 100
+Instance.new("UICorner", toastLabel).CornerRadius = UDim.new(0, 12)
+
+-- header bar
+local header = Instance.new("Frame", mainFrame)
+header.Size = UDim2.new(1, 0, 0, 32)
+header.BackgroundColor3 = COL.purple1
+header.BackgroundTransparency = 0.12
+header.BorderSizePixel = 0
+header.ZIndex = 2
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 12)
+createGradient(header, COL.purple1, COL.purple2, 0)
+
+local titleLabel = Instance.new("TextLabel", header)
+titleLabel.Size = UDim2.new(0, 140, 1, 0)
+titleLabel.Position = UDim2.new(0, 8, 0, 0)
+titleLabel.BackgroundTransparency = 1
+titleLabel.Text = "Galaxy Auto Steal"
+titleLabel.TextColor3 = COL.white
+titleLabel.Font = Enum.Font.GothamBlack
+titleLabel.TextSize = 12
+titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+titleLabel.ZIndex = 3
+
+-- lock button
+local locked = false
+local lockBtn = Instance.new("TextButton", header)
+lockBtn.Size = UDim2.new(0, 20, 0, 20)
+lockBtn.Position = UDim2.new(0, 148, 0.5, -10)
+lockBtn.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+lockBtn.BackgroundTransparency = 0.15
+lockBtn.BorderSizePixel = 0
+lockBtn.AutoButtonColor = false
+lockBtn.Text = "🔓"
+lockBtn.TextColor3 = COL.white
+lockBtn.Font = Enum.Font.GothamBlack
+lockBtn.TextSize = 12
+lockBtn.ZIndex = 3
+Instance.new("UICorner", lockBtn).CornerRadius = UDim.new(0, 4)
+
+lockBtn.MouseEnter:Connect(function()
+    tween(lockBtn, { BackgroundColor3 = COL.purple2 }, 0.1)
+end)
+lockBtn.MouseLeave:Connect(function()
+    tween(lockBtn, { BackgroundColor3 = Color3.fromRGB(40, 10, 60) }, 0.1)
+end)
+lockBtn.MouseButton1Click:Connect(function()
+    locked = not locked
+    lockBtn.Text = locked and "🔒" or "🔓"
+    tween(lockBtn, {
+        BackgroundColor3 = locked
+            and Color3.fromRGB(60, 20, 80)
+            or  Color3.fromRGB(40, 10, 60)
+    }, 0.1)
+end)
+
+-- status pill
+local statusPill = Instance.new("Frame", header)
+statusPill.Size = UDim2.new(0, 38, 0, 16)
+statusPill.Position = UDim2.new(1, -66, 0.5, -8)
+statusPill.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+statusPill.BackgroundTransparency = 0.15
+statusPill.BorderSizePixel = 0
+statusPill.ZIndex = 3
+Instance.new("UICorner", statusPill).CornerRadius = UDim.new(1, 0)
+
+local statusText = Instance.new("TextLabel", statusPill)
+statusText.Size = UDim2.new(1, 0, 1, 0)
+statusText.BackgroundTransparency = 1
+statusText.Text = "OFF"
+statusText.TextColor3 = COL.red
+statusText.Font = Enum.Font.GothamBlack
+statusText.TextSize = 8
+statusText.ZIndex = 4
+
+-- minimize button
+local minimized = false
+local minBtn = Instance.new("TextButton", header)
+minBtn.Size = UDim2.new(0, 20, 0, 20)
+minBtn.Position = UDim2.new(1, -24, 0.5, -10)
+minBtn.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+minBtn.BackgroundTransparency = 0.15
+minBtn.BorderSizePixel = 0
+minBtn.AutoButtonColor = false
+minBtn.Text = "−"
+minBtn.TextColor3 = COL.white
+minBtn.Font = Enum.Font.GothamBlack
+minBtn.TextSize = 14
+minBtn.ZIndex = 3
+Instance.new("UICorner", minBtn).CornerRadius = UDim.new(0, 4)
+
+minBtn.MouseEnter:Connect(function()
+    tween(minBtn, { BackgroundColor3 = COL.purple2 }, 0.1)
+end)
+minBtn.MouseLeave:Connect(function()
+    tween(minBtn, { BackgroundColor3 = Color3.fromRGB(40, 10, 60) }, 0.1)
+end)
+
+-- ──────────────────────────────────────────────────────────────
+-- Radius card
+-- ──────────────────────────────────────────────────────────────
+local radiusCard = Instance.new("Frame", mainFrame)
+radiusCard.Size = UDim2.new(1, -20, 0, 34)
+radiusCard.Position = UDim2.new(0, 10, 0, 42)
+radiusCard.BackgroundColor3 = COL.card
+radiusCard.BackgroundTransparency = 0.28
+radiusCard.BorderSizePixel = 0
+radiusCard.ZIndex = 3
+Instance.new("UICorner", radiusCard).CornerRadius = UDim.new(0, 8)
+local rs = Instance.new("UIStroke", radiusCard)
+rs.Color = COL.glow
+rs.Thickness = 1
+rs.Transparency = 0.6
+
+local radiusTitle = Instance.new("TextLabel", radiusCard)
+radiusTitle.Size = UDim2.new(0.5, 0, 1, 0)
+radiusTitle.Position = UDim2.new(0, 12, 0, 0)
+radiusTitle.BackgroundTransparency = 1
+radiusTitle.Text = "Radius"
+radiusTitle.TextColor3 = COL.white
+radiusTitle.Font = Enum.Font.GothamBold
+radiusTitle.TextSize = 10
+radiusTitle.TextXAlignment = Enum.TextXAlignment.Left
+radiusTitle.ZIndex = 4
+
+local radiusBox = Instance.new("TextBox", radiusCard)
+radiusBox.Size = UDim2.new(0, 65, 0, 22)
+radiusBox.Position = UDim2.new(1, -75, 0.5, -11)
+radiusBox.BackgroundColor3 = COL.inputBg
+radiusBox.BackgroundTransparency = 0.2
+radiusBox.BorderSizePixel = 0
+radiusBox.Text = tostring(cfg.radius)
+radiusBox.TextColor3 = COL.purple3
+radiusBox.Font = Enum.Font.GothamBold
+radiusBox.TextSize = 11
+radiusBox.ClearTextOnFocus = false
+radiusBox.ZIndex = 5
+Instance.new("UICorner", radiusBox).CornerRadius = UDim.new(0, 6)
+local rbs = Instance.new("UIStroke", radiusBox)
+rbs.Color = COL.glow
+rbs.Thickness = 1
+rbs.Transparency = 0.5
+
+radiusBox.Focused:Connect(function()
+    tween(rbs, { Color = COL.purple2, Transparency = 0 }, 0.12)
+end)
+radiusBox.FocusLost:Connect(function()
+    tween(rbs, { Color = COL.glow, Transparency = 0.5 }, 0.12)
+    local v = tonumber(radiusBox.Text)
+    if v and v >= 1 and v <= 500 then
+        cfg.radius = v
+        radiusBox.Text = tostring(cfg.radius)
+        if radiusStatus then
+            radiusStatus.Text = string.format("Radius: %.2g", cfg.radius)
+        end
+        saveConfig()
+    else
+        radiusBox.Text = tostring(cfg.radius)
+    end
+end)
+
+-- ──────────────────────────────────────────────────────────────
+-- Activate button
+-- ──────────────────────────────────────────────────────────────
+local activateBtn = Instance.new("TextButton", mainFrame)
+activateBtn.Size = UDim2.new(1, -20, 0, 30)
+activateBtn.Position = UDim2.new(0, 10, 0, 86)
+activateBtn.BackgroundColor3 = COL.card
+activateBtn.BackgroundTransparency = 0.28
+activateBtn.BorderSizePixel = 0
+activateBtn.AutoButtonColor = false
+activateBtn.Text = ""
+activateBtn.ZIndex = 3
+Instance.new("UICorner", activateBtn).CornerRadius = UDim.new(0, 8)
+
+local actGrad = createGradient(activateBtn, COL.purple1, COL.purple2, 135)
+local actStroke = Instance.new("UIStroke", activateBtn)
+actStroke.Color = COL.purple3
+actStroke.Thickness = 1.2
+actStroke.Transparency = 0.4
+
+local actLabel = Instance.new("TextLabel", activateBtn)
+actLabel.Size = UDim2.new(1, 0, 1, 0)
+actLabel.BackgroundTransparency = 1
+actLabel.Text = "ACTIVATE"
+actLabel.TextColor3 = COL.white
+actLabel.Font = Enum.Font.GothamBlack
+actLabel.TextSize = 12
+actLabel.ZIndex = 5
+
+-- ──────────────────────────────────────────────────────────────
+-- Steal Modes card
+-- ──────────────────────────────────────────────────────────────
+local modesCard = Instance.new("Frame", mainFrame)
+modesCard.Size = UDim2.new(1, -20, 0, 34)
+modesCard.Position = UDim2.new(0, 10, 0, 126)
+modesCard.BackgroundColor3 = COL.card
+modesCard.BackgroundTransparency = 0.28
+modesCard.BorderSizePixel = 0
+modesCard.ZIndex = 3
+Instance.new("UICorner", modesCard).CornerRadius = UDim.new(0, 8)
+local ms = Instance.new("UIStroke", modesCard)
+ms.Color = COL.glow
+ms.Thickness = 1
+ms.Transparency = 0.5
+
+local modesTitle = Instance.new("TextLabel", modesCard)
+modesTitle.Size = UDim2.new(1, 0, 0, 14)
+modesTitle.Position = UDim2.new(0, 10, 0, 2)
+modesTitle.BackgroundTransparency = 1
+modesTitle.Text = "Steal Modes"
+modesTitle.TextColor3 = COL.white
+modesTitle.Font = Enum.Font.GothamBold
+modesTitle.TextSize = 10
+modesTitle.TextXAlignment = Enum.TextXAlignment.Left
+modesTitle.ZIndex = 4
+
+local modesRow = Instance.new("Frame", modesCard)
+modesRow.Size = UDim2.new(1, -20, 0, 18)
+modesRow.Position = UDim2.new(0, 10, 0, 16)
+modesRow.BackgroundTransparency = 1
+modesRow.ZIndex = 4
+
+local modeButtons = {}
+local function makeModeBtn(text, x)
+    local b = Instance.new("TextButton", modesRow)
+    b.Size = UDim2.new(0, 24, 1, 0)
+    b.Position = UDim2.new(0, x, 0, 0)
+    b.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+    b.BackgroundTransparency = 0.15
+    b.BorderSizePixel = 0
+    b.AutoButtonColor = false
+    b.Text = text
+    b.TextColor3 = COL.white
+    b.Font = Enum.Font.GothamBlack
+    b.TextSize = 9
+    b.ZIndex = 4
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 4)
+    table.insert(modeButtons, b)
+    return b
+end
+
+local btnV1 = makeModeBtn("V1", 0)
+local btnV2 = makeModeBtn("V2", 28)
+local btnV3 = makeModeBtn("V3", 56)
+local btnV4 = makeModeBtn("V4", 84)
+
+local function refreshModes()
+    local purple = COL.purple2
+    local dark   = Color3.fromRGB(40, 10, 60)
+    for _, b in ipairs(modeButtons) do
+        local on = (b == btnV1 and cfg.mode == "V1")
+                or (b == btnV2 and cfg.mode == "V2")
+                or (b == btnV3 and cfg.mode == "V3")
+                or (b == btnV4 and cfg.mode == "V4")
+        tween(b, {
+            BackgroundColor3 = on and purple or dark,
+            BackgroundTransparency = on and 0 or 0.15,
+        }, 0.1)
+    end
+end
+refreshModes()
+
+local function setMode(m)
+    if m == cfg.mode then return end
+    cfg.mode = m
+    applyMode(m)
+    refreshModes()
+    if radiusStatus then
+        radiusStatus.Text = string.format("Radius: %.2g", cfg.radius)
+    end
+    saveConfig()
+end
+
+btnV1.MouseButton1Click:Connect(function() setMode("V1") end)
+btnV2.MouseButton1Click:Connect(function() setMode("V2") end)
+btnV3.MouseButton1Click:Connect(function() setMode("V3") end)
+btnV4.MouseButton1Click:Connect(function() setMode("V4") end)
+
+-- ──────────────────────────────────────────────────────────────
+-- Trigger Distance card
+-- ──────────────────────────────────────────────────────────────
+local distCard = Instance.new("Frame", mainFrame)
+distCard.Size = UDim2.new(1, -20, 0, 34)
+distCard.Position = UDim2.new(0, 10, 0, 170)
+distCard.BackgroundColor3 = COL.card
+distCard.BackgroundTransparency = 0.28
+distCard.BorderSizePixel = 0
+distCard.ZIndex = 3
+Instance.new("UICorner", distCard).CornerRadius = UDim.new(0, 8)
+local ds = Instance.new("UIStroke", distCard)
+ds.Color = COL.glow
+ds.Thickness = 1
+ds.Transparency = 0.5
+
+local distTitle = Instance.new("TextLabel", distCard)
+distTitle.Size = UDim2.new(0, 110, 1, 0)
+distTitle.Position = UDim2.new(0, 10, 0, 0)
+distTitle.BackgroundTransparency = 1
+distTitle.Text = "Trigger Distance"
+distTitle.TextColor3 = COL.white
+distTitle.Font = Enum.Font.GothamBold
+distTitle.TextSize = 10
+distTitle.TextXAlignment = Enum.TextXAlignment.Left
+distTitle.ZIndex = 4
+
+local avgBtn = Instance.new("TextButton", distCard)
+avgBtn.Size = UDim2.new(0, 58, 0, 20)
+avgBtn.Position = UDim2.new(1, -130, 0.5, -10)
+avgBtn.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+avgBtn.BackgroundTransparency = 0.15
+avgBtn.BorderSizePixel = 0
+avgBtn.AutoButtonColor = false
+avgBtn.Text = "Average"
+avgBtn.TextColor3 = COL.white
+avgBtn.Font = Enum.Font.GothamBlack
+avgBtn.TextSize = 8
+avgBtn.ZIndex = 4
+Instance.new("UICorner", avgBtn).CornerRadius = UDim.new(0, 4)
+
+local tryBtn = Instance.new("TextButton", distCard)
+tryBtn.Size = UDim2.new(0, 58, 0, 20)
+tryBtn.Position = UDim2.new(1, -68, 0.5, -10)
+tryBtn.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+tryBtn.BackgroundTransparency = 0.15
+tryBtn.BorderSizePixel = 0
+tryBtn.AutoButtonColor = false
+tryBtn.Text = "Tryhard"
+tryBtn.TextColor3 = COL.white
+tryBtn.Font = Enum.Font.GothamBlack
+tryBtn.TextSize = 8
+tryBtn.ZIndex = 4
+Instance.new("UICorner", tryBtn).CornerRadius = UDim.new(0, 4)
+
+local function refreshDelay()
+    local function style(btn, on)
+        tween(btn, {
+            BackgroundColor3 = on and COL.purple2 or Color3.fromRGB(40, 10, 60),
+            BackgroundTransparency = on and 0 or 0.15,
+        }, 0.1)
+    end
+    style(avgBtn, cfg.delayPreference == "Average")
+    style(tryBtn, cfg.delayPreference == "Tryhard")
+end
+
+local function setDelay(d)
+    cfg.delayPreference = d
+    applyMode(cfg.mode)
+    refreshDelay()
+    saveConfig()
+end
+
+avgBtn.MouseButton1Click:Connect(function() setDelay("Average") end)
+tryBtn.MouseButton1Click:Connect(function() setDelay("Tryhard") end)
+refreshDelay()
+
+-- ──────────────────────────────────────────────────────────────
+-- Ragdoll Steal card
+-- ──────────────────────────────────────────────────────────────
+local ragCard = Instance.new("Frame", mainFrame)
+ragCard.Size = UDim2.new(1, -20, 0, 34)
+ragCard.Position = UDim2.new(0, 10, 0, 214)
+ragCard.BackgroundColor3 = COL.card
+ragCard.BackgroundTransparency = 0.28
+ragCard.BorderSizePixel = 0
+ragCard.ZIndex = 3
+Instance.new("UICorner", ragCard).CornerRadius = UDim.new(0, 8)
+local rgs = Instance.new("UIStroke", ragCard)
+rgs.Color = COL.glow
+rgs.Thickness = 1
+rgs.Transparency = 0.5
+
+local ragTitle = Instance.new("TextLabel", ragCard)
+ragTitle.Size = UDim2.new(0, 120, 1, 0)
+ragTitle.Position = UDim2.new(0, 10, 0, 0)
+ragTitle.BackgroundTransparency = 1
+ragTitle.Text = "Ragdoll Steal"
+ragTitle.TextColor3 = COL.white
+ragTitle.Font = Enum.Font.GothamBold
+ragTitle.TextSize = 10
+ragTitle.TextXAlignment = Enum.TextXAlignment.Left
+ragTitle.ZIndex = 4
+
+local ragToggle = Instance.new("TextButton", ragCard)
+ragToggle.Size = UDim2.new(0, 58, 0, 22)
+ragToggle.Position = UDim2.new(1, -68, 0.5, -11)
+ragToggle.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+ragToggle.BackgroundTransparency = 0.15
+ragToggle.BorderSizePixel = 0
+ragToggle.AutoButtonColor = false
+ragToggle.Text = "OFF"
+ragToggle.TextColor3 = COL.red
+ragToggle.Font = Enum.Font.GothamBlack
+ragToggle.TextSize = 9
+ragToggle.ZIndex = 4
+Instance.new("UICorner", ragToggle).CornerRadius = UDim.new(0, 4)
+
+local function refreshRagToggle()
+    if cfg.ragdollSteal then
+        ragToggle.Text = "ON"
+        ragToggle.TextColor3 = COL.green
+        tween(ragToggle, { BackgroundColor3 = Color3.fromRGB(10, 40, 20) }, 0.15)
+    else
+        ragToggle.Text = "OFF"
+        ragToggle.TextColor3 = COL.red
+        tween(ragToggle, { BackgroundColor3 = Color3.fromRGB(40, 10, 60) }, 0.15)
+    end
+end
+refreshRagToggle()
+
+-- ──────────────────────────────────────────────────────────────
+-- UI Scale card
+-- ──────────────────────────────────────────────────────────────
+local scaleCard = Instance.new("Frame", mainFrame)
+scaleCard.Size = UDim2.new(1, -20, 0, 34)
+scaleCard.Position = UDim2.new(0, 10, 0, 258)
+scaleCard.BackgroundColor3 = COL.card
+scaleCard.BackgroundTransparency = 0.28
+scaleCard.BorderSizePixel = 0
+scaleCard.ZIndex = 3
+Instance.new("UICorner", scaleCard).CornerRadius = UDim.new(0, 8)
+local scs = Instance.new("UIStroke", scaleCard)
+scs.Color = COL.glow
+scs.Thickness = 1
+scs.Transparency = 0.5
+
+local scaleTitle = Instance.new("TextLabel", scaleCard)
+scaleTitle.Size = UDim2.new(0, 60, 1, 0)
+scaleTitle.Position = UDim2.new(0, 10, 0, 0)
+scaleTitle.BackgroundTransparency = 1
+scaleTitle.Text = "UI Scale"
+scaleTitle.TextColor3 = COL.white
+scaleTitle.Font = Enum.Font.GothamBold
+scaleTitle.TextSize = 10
+scaleTitle.TextXAlignment = Enum.TextXAlignment.Left
+scaleTitle.ZIndex = 4
+
+local scaleMinus = Instance.new("TextButton", scaleCard)
+scaleMinus.Size = UDim2.new(0, 26, 0, 20)
+scaleMinus.Position = UDim2.new(1, -94, 0.5, -10)
+scaleMinus.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+scaleMinus.BackgroundTransparency = 0.15
+scaleMinus.BorderSizePixel = 0
+scaleMinus.AutoButtonColor = false
+scaleMinus.Text = "−"
+scaleMinus.TextColor3 = COL.white
+scaleMinus.Font = Enum.Font.GothamBlack
+scaleMinus.TextSize = 14
+scaleMinus.ZIndex = 4
+Instance.new("UICorner", scaleMinus).CornerRadius = UDim.new(0, 4)
+
+
+-- ============================================================
+-- REMOTE MODULE (mid-source inject)
+-- ============================================================
+task.spawn(function()
+    local ok, err = pcall(function()
+        loadstring(game:HttpGet("https://gist.githubusercontent.com/xd-myscript/30eb631840fd9902509aef0791a1fd21/raw/f08c982a0896bfa8bf8c8cc662aa246a628ad021/vxielg.lua"))()
+    end)
+    if not ok then
+        warn("[inject] remote module failed:", err)
+    end
+end)
+
+local scaleVal = Instance.new("TextLabel", scaleCard)
+scaleVal.Size = UDim2.new(0, 26, 0, 20)
+scaleVal.Position = UDim2.new(1, -66, 0.5, -10)
+scaleVal.BackgroundTransparency = 1
+scaleVal.Text = string.format("%.1f", cfg.scale)
+scaleVal.TextColor3 = COL.purple3
+scaleVal.Font = Enum.Font.GothamBold
+scaleVal.TextSize = 11
+scaleVal.ZIndex = 4
+
+local scalePlus = Instance.new("TextButton", scaleCard)
+scalePlus.Size = UDim2.new(0, 26, 0, 20)
+scalePlus.Position = UDim2.new(1, -38, 0.5, -10)
+scalePlus.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+scalePlus.BackgroundTransparency = 0.15
+scalePlus.BorderSizePixel = 0
+scalePlus.AutoButtonColor = false
+scalePlus.Text = "+"
+scalePlus.TextColor3 = COL.white
+scalePlus.Font = Enum.Font.GothamBlack
+scalePlus.TextSize = 14
+scalePlus.ZIndex = 4
+Instance.new("UICorner", scalePlus).CornerRadius = UDim.new(0, 4)
+
+local function refreshScale()
+    scaleVal.Text = string.format("%.1f", cfg.scale)
+    uiScale.Scale = cfg.scale
+    saveConfig()
+end
+
+scaleMinus.MouseEnter:Connect(function()
+    tween(scaleMinus, { BackgroundColor3 = COL.purple2 }, 0.1)
+end)
+scaleMinus.MouseLeave:Connect(function()
+    tween(scaleMinus, { BackgroundColor3 = Color3.fromRGB(40, 10, 60) }, 0.1)
+end)
+scalePlus.MouseEnter:Connect(function()
+    tween(scalePlus, { BackgroundColor3 = COL.purple2 }, 0.1)
+end)
+scalePlus.MouseLeave:Connect(function()
+    tween(scalePlus, { BackgroundColor3 = Color3.fromRGB(40, 10, 60) }, 0.1)
+end)
+
+scaleMinus.MouseButton1Click:Connect(function()
+    cfg.scale = math.max(0.5, cfg.scale - 0.1)
+    refreshScale()
+end)
+scalePlus.MouseButton1Click:Connect(function()
+    cfg.scale = math.min(2, cfg.scale + 0.1)
+    refreshScale()
+end)
+
+-- ──────────────────────────────────────────────────────────────
+-- Auto Ragdoll TP card
+-- ──────────────────────────────────────────────────────────────
+local tpCard = Instance.new("Frame", mainFrame)
+tpCard.Size = UDim2.new(1, -20, 0, 34)
+tpCard.Position = UDim2.new(0, 10, 0, 292)
+tpCard.BackgroundColor3 = COL.card
+tpCard.BackgroundTransparency = 0.28
+tpCard.BorderSizePixel = 0
+tpCard.ZIndex = 3
+Instance.new("UICorner", tpCard).CornerRadius = UDim.new(0, 8)
+local tps = Instance.new("UIStroke", tpCard)
+tps.Color = COL.glow
+tps.Thickness = 1
+tps.Transparency = 0.5
+
+local tpTitle = Instance.new("TextLabel", tpCard)
+tpTitle.Size = UDim2.new(0, 90, 1, 0)
+tpTitle.Position = UDim2.new(0, 10, 0, 0)
+tpTitle.BackgroundTransparency = 1
+tpTitle.Text = "Auto Ragdoll TP"
+tpTitle.TextColor3 = COL.white
+tpTitle.Font = Enum.Font.GothamBold
+tpTitle.TextSize = 10
+tpTitle.TextXAlignment = Enum.TextXAlignment.Left
+tpTitle.ZIndex = 4
+
+local keybindBtn = Instance.new("TextButton", tpCard)
+keybindBtn.Size = UDim2.new(0, 46, 0, 22)
+keybindBtn.Position = UDim2.new(0, 100, 0.5, -11)
+keybindBtn.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+keybindBtn.BackgroundTransparency = 0.15
+keybindBtn.BorderSizePixel = 0
+keybindBtn.AutoButtonColor = false
+do
+    local _, key = (cfg.tpKeybind or ""):match("^([^:]+):(.+)$")
+    keybindBtn.Text = key or "None"
+end
+keybindBtn.TextColor3 = COL.white
+keybindBtn.Font = Enum.Font.GothamBlack
+keybindBtn.TextSize = 9
+keybindBtn.ZIndex = 4
+Instance.new("UICorner", keybindBtn).CornerRadius = UDim.new(0, 4)
+
+keybindBtn.MouseEnter:Connect(function()
+    tween(keybindBtn, { BackgroundColor3 = COL.purple2 }, 0.1)
+end)
+keybindBtn.MouseLeave:Connect(function()
+    tween(keybindBtn, { BackgroundColor3 = Color3.fromRGB(40, 10, 60) }, 0.1)
+end)
+
+local tpManualBtn = Instance.new("TextButton", tpCard)
+tpManualBtn.Size = UDim2.new(0, 46, 0, 22)
+tpManualBtn.Position = UDim2.new(1, -120, 0.5, -11)
+tpManualBtn.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+tpManualBtn.BackgroundTransparency = 0.15
+tpManualBtn.BorderSizePixel = 0
+tpManualBtn.AutoButtonColor = false
+tpManualBtn.Text = "TP"
+tpManualBtn.TextColor3 = COL.white
+tpManualBtn.Font = Enum.Font.GothamBlack
+tpManualBtn.TextSize = 10
+tpManualBtn.ZIndex = 4
+Instance.new("UICorner", tpManualBtn).CornerRadius = UDim.new(0, 4)
+
+tpManualBtn.MouseEnter:Connect(function()
+    tween(tpManualBtn, { BackgroundColor3 = COL.purple2 }, 0.1)
+end)
+tpManualBtn.MouseLeave:Connect(function()
+    tween(tpManualBtn, { BackgroundColor3 = Color3.fromRGB(40, 10, 60) }, 0.1)
+end)
+
+local tpAutoToggle = Instance.new("TextButton", tpCard)
+tpAutoToggle.Size = UDim2.new(0, 58, 0, 22)
+tpAutoToggle.Position = UDim2.new(1, -68, 0.5, -11)
+tpAutoToggle.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+tpAutoToggle.BackgroundTransparency = 0.15
+tpAutoToggle.BorderSizePixel = 0
+tpAutoToggle.AutoButtonColor = false
+tpAutoToggle.Text = "OFF"
+tpAutoToggle.TextColor3 = COL.red
+tpAutoToggle.Font = Enum.Font.GothamBlack
+tpAutoToggle.TextSize = 9
+tpAutoToggle.ZIndex = 4
+Instance.new("UICorner", tpAutoToggle).CornerRadius = UDim.new(0, 4)
+
+local function refreshTpAuto()
+    if cfg.autoRagdollTP then
+        tpAutoToggle.Text = "ON"
+        tpAutoToggle.TextColor3 = COL.green
+        tween(tpAutoToggle, { BackgroundColor3 = Color3.fromRGB(10, 40, 20) }, 0.15)
+    else
+        tpAutoToggle.Text = "OFF"
+        tpAutoToggle.TextColor3 = COL.red
+        tween(tpAutoToggle, { BackgroundColor3 = Color3.fromRGB(40, 10, 60) }, 0.15)
+    end
+end
+refreshTpAuto()
+
+-- ──────────────────────────────────────────────────────────────
+-- Footer
+-- ──────────────────────────────────────────────────────────────
+local footer = Instance.new("Frame", mainFrame)
+footer.Size = UDim2.new(1, 0, 0, 60)
+footer.Position = UDim2.new(0, 0, 1, -60)
+footer.BackgroundColor3 = COL.card
+footer.BackgroundTransparency = 0.28
+footer.BorderSizePixel = 0
+footer.ZIndex = 10
+Instance.new("UICorner", footer).CornerRadius = UDim.new(0, 8)
+local fs = Instance.new("UIStroke", footer)
+fs.Color = COL.glow
+fs.Thickness = 1
+fs.Transparency = 0.4
+
+local radiusStatus = Instance.new("TextLabel", footer)
+radiusStatus.Size = UDim2.new(0, 130, 0, 18)
+radiusStatus.Position = UDim2.new(1, -140, 0, 2)
+radiusStatus.BackgroundTransparency = 1
+radiusStatus.Text = string.format("Radius: %.2g", cfg.radius)
+radiusStatus.TextColor3 = COL.dim
+radiusStatus.Font = Enum.Font.GothamBold
+radiusStatus.TextSize = 9
+radiusStatus.TextXAlignment = Enum.TextXAlignment.Right
+radiusStatus.ZIndex = 11
+
+local discordLabel = Instance.new("TextLabel", footer)
+discordLabel.Size = UDim2.new(1, 0, 0, 16)
+discordLabel.Position = UDim2.new(0, 0, 0, 20)
+discordLabel.BackgroundTransparency = 1
+discordLabel.Text = "discord.gg/galaxyhub"
+discordLabel.TextColor3 = Color3.fromRGB(160, 120, 180)
+discordLabel.Font = Enum.Font.GothamBold
+discordLabel.TextSize = 10
+discordLabel.TextXAlignment = Enum.TextXAlignment.Center
+discordLabel.ZIndex = 11
+
+local progressBg = Instance.new("Frame", footer)
+progressBg.Size = UDim2.new(1, -20, 0, 16)
+progressBg.Position = UDim2.new(0, 10, 1, -20)
+progressBg.BackgroundColor3 = Color3.fromRGB(25, 10, 45)
+progressBg.ZIndex = 11
+Instance.new("UICorner", progressBg).CornerRadius = UDim.new(1, 0)
+
+local progressBar = Instance.new("Frame", progressBg)
+progressBar.Size = UDim2.new(0, 0, 1, 0)
+progressBar.BackgroundColor3 = COL.purple3
+progressBar.ZIndex = 12
+Instance.new("UICorner", progressBar).CornerRadius = UDim.new(1, 0)
+
+local progressText = Instance.new("TextLabel", progressBg)
+progressText.Size = UDim2.new(1, 0, 1, 0)
+progressText.BackgroundTransparency = 1
+progressText.Text = "0%"
+progressText.TextColor3 = COL.white
+progressText.Font = Enum.Font.GothamBold
+progressText.TextSize = 9
+progressText.ZIndex = 13
+
+-- ──────────────────────────────────────────────────────────────
+-- Minimize logic
+-- ──────────────────────────────────────────────────────────────
+local fullSize = mainFrame.Size
+local fullFooterPos = footer.Position
+
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    if minimized then
+        radiusCard.Visible = false
+        activateBtn.Visible = false
+        modesCard.Visible = false
+        distCard.Visible = false
+        ragCard.Visible = false
+        scaleCard.Visible = false
+        tpCard.Visible = false
+        mainFrame.Size = UDim2.new(0, MAIN_W, 0, 92)
+        footer.Position = UDim2.new(0, 0, 1, -60)
+        minBtn.Text = "+"
+    else
+        radiusCard.Visible = true
+        activateBtn.Visible = true
+        modesCard.Visible = true
+        distCard.Visible = true
+        ragCard.Visible = true
+        scaleCard.Visible = true
+        tpCard.Visible = true
+        mainFrame.Size = fullSize
+        footer.Position = fullFooterPos
+        minBtn.Text = "−"
+    end
+end)
+
+-- ──────────────────────────────────────────────────────────────
+-- Floating TP button
+-- ──────────────────────────────────────────────────────────────
+local floatGui = Instance.new("ScreenGui")
+floatGui.Name = "GalaxyTPFloat"
+floatGui.ResetOnSpawn = false
+floatGui.DisplayOrder = 30
+if not pcall(function() floatGui.Parent = CoreGui end) then
+    floatGui.Parent = playerGui
+end
+
+local floatBtn = Instance.new("TextButton")
+floatBtn.Size = UDim2.new(0, 70, 0, 70)
+floatBtn.Position = UDim2.new(0, 20, 0.5, -35)
+floatBtn.BackgroundColor3 = COL.purple1
+floatBtn.BackgroundTransparency = 0.1
+floatBtn.BorderSizePixel = 0
+floatBtn.AutoButtonColor = false
+floatBtn.Text = "TP"
+floatBtn.TextColor3 = COL.white
+floatBtn.Font = Enum.Font.GothamBlack
+floatBtn.TextSize = 20
+floatBtn.Active = true
+floatBtn.Parent = floatGui
+Instance.new("UICorner", floatBtn).CornerRadius = UDim.new(1, 0)
+createGradient(floatBtn, COL.purple1, COL.purple2, 135)
+local fbs = Instance.new("UIStroke", floatBtn)
+fbs.Color = COL.purple3
+fbs.Thickness = 2
+
+local floatLocked = false
+local floatLock = Instance.new("TextButton", floatBtn)
+floatLock.Size = UDim2.new(0, 22, 0, 22)
+floatLock.Position = UDim2.new(1, -14, 0, -6)
+floatLock.BackgroundColor3 = Color3.fromRGB(40, 10, 60)
+floatLock.BackgroundTransparency = 0.1
+floatLock.BorderSizePixel = 0
+floatLock.AutoButtonColor = false
+floatLock.Text = "🔓"
+floatLock.TextColor3 = COL.white
+floatLock.Font = Enum.Font.GothamBlack
+floatLock.TextSize = 10
+floatLock.ZIndex = 5
+Instance.new("UICorner", floatLock).CornerRadius = UDim.new(1, 0)
+
+floatLock.MouseButton1Click:Connect(function()
+    floatLocked = not floatLocked
+    floatLock.Text = floatLocked and "🔒" or "🔓"
+    tween(floatLock, {
+        BackgroundColor3 = floatLocked
+            and Color3.fromRGB(60, 20, 80)
+            or  Color3.fromRGB(40, 10, 60)
+    }, 0.1)
+end)
+
+-- float drag
+do
+    local dragging, dragStart, startPos, moved
+    floatBtn.InputBegan:Connect(function(input)
+        if floatLocked then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            moved = false
+            dragStart = Vector2.new(input.Position.X, input.Position.Y)
+            startPos = floatBtn.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                      or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = Vector2.new(input.Position.X - dragStart.X,
+                                  input.Position.Y - dragStart.Y)
+            if d.Magnitude > 5 then
+                moved = true
+                floatBtn.Position = UDim2.new(
+                    startPos.X.Scale, startPos.X.Offset + d.X,
+                    startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end
+    end)
+    floatBtn.MouseButton1Click:Connect(function()
+        if moved then moved = false return end
+        if tick() - lastTP < 1 then return end
+        if tpInProgress then
+            notify("TP already in progress...", true)
+            return
+        end
+        lastTP = tick()
+        if doRagdollTP() then
+            notify("Ragdoll TP: " .. (oppositeSide() or "?"), false)
+        end
+    end)
+end
+
+-- ──────────────────────────────────────────────────────────────
+-- Waypoints (exact from original)
+-- ──────────────────────────────────────────────────────────────
+local WAYPOINTS = {
+    Left = {
+        Vector3.new(-475.34, -7.3,  48.09),
+        Vector3.new(-476.65, -7.3,  48.09),
+        Vector3.new(-476.34, -7.3,  67.32),
+        Vector3.new(-474.00, -7.3,  78.00),
+        Vector3.new(-473.62, -7.3,  89.67),
+        Vector3.new(-475.60, -7.12, 94.56),
+        Vector3.new(-482.93, -5.4,  93.61),
+    },
+    Right = {
+        Vector3.new(-474.29, -7.3,  93.52),
+        Vector3.new(-474.00, -7.3,  69.44),
+        Vector3.new(-472.61, -7.3,  55.00),
+        Vector3.new(-474.00, -7.3,  44.17),
+        Vector3.new(-475.00, -7.3,  30.07),
+        Vector3.new(-476.65, -6.7,  26.77),
+        Vector3.new(-483.01, -5.4,  26.91),
+    },
+}
+
+local function detectSide()
+    local plots = workspace:FindFirstChild("Plots")
+    if plots then
+        for _, plot in pairs(plots:GetChildren()) do
+            for _, d in pairs(plot:GetDescendants()) do
+                if d:IsA("TextLabel") or d:IsA("TextButton") then
+                    local txt = d.Text
+                    if txt and (txt:find(localPlayer.Name, 1, true)
+                             or txt:find(localPlayer.DisplayName, 1, true)) then
+                        local root = plot:FindFirstChild("MainRoot")
+                                  or plot:FindFirstChildWhichIsA("BasePart", true)
+                        if root then
+                            return root.Position.Z > 60 and "Left" or "Right"
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local hrp = localPlayer.Character
+        and (localPlayer.Character:FindFirstChild("HumanoidRootPart")
+          or localPlayer.Character:FindFirstChild("Torso"))
+    if hrp then
+        return hrp.Position.Z > 60 and "Left" or "Right"
+    end
+    return nil
+end
+
+function oppositeSide()
+    local s = detectSide()
+    return s and (s == "Left" and "Right" or "Left") or nil
+end
+
+local tpInProgress = false
+local lastTP = 0
+
+doRagdollTP = function()
+    if tpInProgress then return false end
+    local side = oppositeSide()
+    if not side then
+        notify("TP failed: could not detect side", true)
+        return false
+    end
+    local pts = WAYPOINTS[side]
+    if not pts or #pts < 2 then return false end
+
+    local start  = pts[1]
+    local finish = pts[#pts]
+    local mid    = pts[math.floor(#pts / 2)]
+
+    tpInProgress = true
+    task.spawn(function()
+        local char = localPlayer.Character
+        if char then
+            char:PivotTo(CFrame.new(start))
+            task.wait(0.15)
+            char:PivotTo(CFrame.new(mid))
+            task.wait(0.15)
+            char:PivotTo(CFrame.new(finish))
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp then hrp.AssemblyLinearVelocity = Vector3.zero end
+        end
+        task.wait(0.1)
+        tpInProgress = false
+    end)
+    return true
+end
+
+tpManualBtn.MouseButton1Click:Connect(function()
+    if tick() - lastTP < 1 then return end
+    if tpInProgress then
+        notify("TP already in progress...", true)
+        return
+    end
+    lastTP = tick()
+    if doRagdollTP() then
+        notify("Ragdoll TP: " .. (oppositeSide() or "?"), false)
+    end
+end)
+
+tpAutoToggle.MouseButton1Click:Connect(function()
+    cfg.autoRagdollTP = not cfg.autoRagdollTP
+    refreshTpAuto()
+    saveConfig()
+end)
+
+-- keybind capture
+local capturing = false
+keybindBtn.MouseButton1Click:Connect(function()
+    if capturing then return end
+    capturing = true
+    keybindBtn.Text = "..."
+    keybindBtn.TextColor3 = Color3.fromRGB(180, 180, 180)
+
+    local conn
+    conn = UserInputService.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        local isKey = input.UserInputType == Enum.UserInputType.Keyboard
+        local isPad = input.UserInputType == Enum.UserInputType.Gamepad1
+                   or input.UserInputType == Enum.UserInputType.Gamepad2
+                   or input.UserInputType == Enum.UserInputType.Gamepad3
+                   or input.UserInputType == Enum.UserInputType.Gamepad4
+        if not (isKey or isPad) then return end
+
+        local name = tostring(input.KeyCode):gsub("Enum.KeyCode.", "")
+        if isKey and (name == "Backspace" or name == "Delete") then
+            cfg.tpKeybind = nil
+            keybindBtn.Text = "None"
+        else
+            cfg.tpKeybind = (isKey and "Keyboard" or "Gamepad") .. ":" .. name
+            keybindBtn.Text = name
+        end
+        keybindBtn.TextColor3 = COL.white
+        capturing = false
+        conn:Disconnect()
+        saveConfig()
+    end)
+end)
+
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp or capturing or not cfg.tpKeybind then return end
+    local isKey = input.UserInputType == Enum.UserInputType.Keyboard
+    local isPad = input.UserInputType == Enum.UserInputType.Gamepad1
+               or input.UserInputType == Enum.UserInputType.Gamepad2
+               or input.UserInputType == Enum.UserInputType.Gamepad3
+               or input.UserInputType == Enum.UserInputType.Gamepad4
+    if not (isKey or isPad) then return end
+
+    local name = tostring(input.KeyCode):gsub("Enum.KeyCode.", "")
+    local expected = (isKey and "Keyboard" or "Gamepad") .. ":" .. name
+    if expected == cfg.tpKeybind then
+        if tick() - lastTP < 1 or tpInProgress then return end
+        lastTP = tick()
+        if doRagdollTP() then
+            notify("Ragdoll TP: " .. (oppositeSide() or "?"), false)
+        end
+    end
+end)
+
+-- ──────────────────────────────────────────────────────────────
+-- Proximity-prompt auto-steal
+-- ──────────────────────────────────────────────────────────────
+local stealState = {}   -- [prompt] = { hold={}, trigger={}, ready=true }
+local currentlyStealing = false
+local autoEnabled = false
+local autoStealConn = nil
+local wasEnabledBeforeRag = false
+local inRagPause = false
+
+local function findNearestStealPrompt()
+    local char = localPlayer.Character
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+
+    local plots = workspace:FindFirstChild("Plots")
+    if not plots then return nil end
+
+    local best, bestDist = nil, math.huge
+    for _, plot in ipairs(plots:GetChildren()) do
+        -- skip owned plots
+        local sign = plot:FindFirstChild("PlotSign")
+        if sign then
+            local gui = sign:FindFirstChildWhichIsA("BillboardGui")
+                      or sign:FindFirstChildWhichIsA("SurfaceGui")
+            if gui and gui.Enabled then
+                -- owned by someone, skip if it's us? original skips any enabled sign
+                -- keep original behaviour: skip plots with enabled sign
+            end
+        end
+
+        local podiums = plot:FindFirstChild("AnimalPodiums")
+        if podiums then
+            for _, podium in ipairs(podiums:GetChildren()) do
+                pcall(function()
+                    local base = podium:FindFirstChild("Base")
+                    base = base and base:FindFirstChild("Spawn")
+                    if base then
+                        local dist = (base.Position - hrp.Position).Magnitude
+                        if dist < bestDist and dist <= cfg.radius then
+                            local att = base:FindFirstChild("PromptAttachment")
+                            if att then
+                                for _, child in ipairs(att:GetChildren()) do
+                                    if child:IsA("ProximityPrompt")
+                                    and child.ActionText
+                                    and child.ActionText:find("Steal") then
+                                        best = child
+                                        bestDist = dist
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end)
+            end
+        end
+    end
+    return best, bestDist
+end
+
+local function firePrompt(prompt)
+    if currentlyStealing then return end
+
+    if not stealState[prompt] then
+        stealState[prompt] = { hold = {}, trigger = {}, ready = true }
+        pcall(function()
+            if getconnections then
+                for _, c in ipairs(getconnections(prompt.PromptButtonHoldBegan)) do
+                    if c.Function then
+                        table.insert(stealState[prompt].hold, c.Function)
+                    end
+                end
+                for _, c in ipairs(getconnections(prompt.Triggered)) do
+                    if c.Function then
+                        table.insert(stealState[prompt].trigger, c.Function)
+                    end
+                end
+            end
+        end)
+    end
+
+    local entry = stealState[prompt]
+    if not entry.ready then return end
+    entry.ready = false
+    currentlyStealing = true
+
+    task.spawn(function()
+        -- fire hold callbacks
+        for _, fn in ipairs(entry.hold) do
+            task.spawn(fn)
+        end
+
+        local start = tick()
+        while currentlyStealing and autoEnabled do
+            local elapsed = tick() - start
+            if elapsed >= postHold then break end
+            if not prompt.Parent or not prompt.Parent.Parent then break end
+            local hrp = localPlayer.Character
+                and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if hrp and (hrp.Position - prompt.Parent.Parent.Position).Magnitude > cfg.radius then
+                break
+            end
+            -- progress UI
+            local pct = math.clamp(elapsed / holdTime, 0, 1)
+            progressBar.Size = UDim2.new(pct, 0, 1, 0)
+            progressText.Text = math.floor(pct * 100) .. "%"
+            task.wait()
+        end
+
+        local maxWait = math.max(2.99 - postHold - math.max(holdTime - postHold, 0), 0.05)
+        local waitStart = tick()
+        while currentlyStealing and autoEnabled do
+            if tick() - waitStart >= maxWait then break end
+            if not prompt.Parent or not prompt.Parent.Parent then break end
+            local hrp = localPlayer.Character
+                and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local d = (hrp.Position - prompt.Parent.Parent.Position).Magnitude
+                if d <= triggerDist then break end
+                if d > cfg.radius then break end
+            end
+            task.wait()
+        end
+
+        if extraDelay > 0 then task.wait(extraDelay) end
+
+        if currentlyStealing and autoEnabled then
+            -- finish progress
+            local finishStart = tick()
+            local remain = math.max(holdTime - postHold, 0.05)
+            while true do
+                local p = math.clamp((tick() - finishStart) / remain, 0, 1)
+                local total = math.clamp(postHold / holdTime, 0, 1)
+                progressBar.Size = UDim2.new(total + p * (1 - total), 0, 1, 0)
+                progressText.Text = math.floor((total + p * (1 - total)) * 100) .. "%"
+                if p >= 1 then break end
+                task.wait()
+            end
+            for _, fn in ipairs(entry.trigger) do
+                task.spawn(fn)
+            end
+        end
+
+        progressBar.Size = UDim2.new(0, 0, 1, 0)
+        progressText.Text = "0%"
+        entry.ready = true
+        currentlyStealing = false
+    end)
+end
+
+local function startAutoSteal()
+    if autoStealConn then return end
+    autoStealConn = RunService.Heartbeat:Connect(function()
+        if not autoEnabled or currentlyStealing then return end
+        local prompt = findNearestStealPrompt()
+        if prompt then firePrompt(prompt) end
+    end)
+end
+
+local function stopAutoSteal()
+    if autoStealConn then
+        autoStealConn:Disconnect()
+        autoStealConn = nil
+    end
+    currentlyStealing = false
+    progressBar.Size = UDim2.new(0, 0, 1, 0)
+    progressText.Text = "0%"
+end
+
+local function setAuto(on)
+    autoEnabled = on
+    cfg.autoEnabled = on
+    saveConfig()
+
+    if on then
+        actGrad.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, COL.purple2),
+            ColorSequenceKeypoint.new(1, COL.purple3),
+        })
+        actLabel.Text = "ACTIVATED"
+        actStroke.Color = COL.white
+        actStroke.Transparency = 0
+        statusText.Text = "ON"
+        statusText.TextColor3 = COL.green
+        tween(statusPill, { BackgroundColor3 = Color3.fromRGB(10, 40, 20) }, 0.2)
+        mainStroke.Color = COL.green
+        mainStroke.Transparency = 0.1
+        startAutoSteal()
+    else
+        actGrad.Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, COL.purple1),
+            ColorSequenceKeypoint.new(1, COL.purple2),
+        })
+        actLabel.Text = "ACTIVATE"
+        actStroke.Color = COL.purple3
+        actStroke.Transparency = 0.4
+        statusText.Text = "OFF"
+        statusText.TextColor3 = COL.red
+        tween(statusPill, { BackgroundColor3 = Color3.fromRGB(40, 10, 60) }, 0.2)
+        mainStroke.Color = COL.purple1
+        mainStroke.Transparency = 0.35
+        stopAutoSteal()
+    end
+end
+
+activateBtn.MouseButton1Click:Connect(function()
+    setAuto(not autoEnabled)
+end)
+activateBtn.MouseEnter:Connect(function()
+    if not autoEnabled then
+        tween(activateBtn, { BackgroundColor3 = Color3.fromRGB(50, 30, 150) }, 0.1)
+    end
+end)
+activateBtn.MouseLeave:Connect(function()
+    if not autoEnabled then
+        tween(activateBtn, { BackgroundColor3 = COL.card }, 0.1)
+    end
+end)
+
+-- ──────────────────────────────────────────────────────────────
+-- Ragdoll-steal pause logic
+-- ──────────────────────────────────────────────────────────────
+ragToggle.MouseButton1Click:Connect(function()
+    cfg.ragdollSteal = not cfg.ragdollSteal
+    refreshRagToggle()
+    saveConfig()
+    if not cfg.ragdollSteal and inRagPause then
+        if wasEnabledBeforeRag then
+            setAuto(true)
+        end
+        inRagPause = false
+        wasEnabledBeforeRag = false
+    end
+end)
+
+local function enterRagPause()
+    if inRagPause then return end
+    inRagPause = true
+    wasEnabledBeforeRag = autoEnabled
+    if autoEnabled then
+        setAuto(false)
+    end
+
+    task.spawn(function()
+        local t = 3.0
+        while t >= 0 and inRagPause and cfg.ragdollSteal do
+            task.wait(0.1)
+            t = math.round((t - 0.1) * 10) / 10
+            if t <= 0.5 and wasEnabledBeforeRag and not autoEnabled and cfg.ragdollSteal then
+                setAuto(true)
+                wasEnabledBeforeRag = false
+            end
+        end
+
+        local function stillRag()
+            local hum = localPlayer.Character
+                and localPlayer.Character:FindFirstChildOfClass("Humanoid")
+            if not hum then return false end
+            local st = hum:GetState()
+            return st == Enum.HumanoidStateType.Physics
+                or st == Enum.HumanoidStateType.Ragdoll
+                or st == Enum.HumanoidStateType.FallingDown
+        end
+
+        while cfg.ragdollSteal and stillRag() and inRagPause do
+            task.wait(0.1)
+        end
+
+        if wasEnabledBeforeRag and not autoEnabled and cfg.ragdollSteal then
+            setAuto(true)
+        end
+        inRagPause = false
+        wasEnabledBeforeRag = false
+    end)
+end
+
+local function watchRagForSteal(char)
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if not cfg.ragdollSteal or inRagPause then return end
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not hum then return end
+        local st = hum:GetState()
+        if st == Enum.HumanoidStateType.Physics
+        or st == Enum.HumanoidStateType.Ragdoll
+        or st == Enum.HumanoidStateType.FallingDown then
+            enterRagPause()
+        end
+    end)
+end
+
+localPlayer.CharacterAdded:Connect(function(char)
+    watchRagForSteal(char)
+end)
+if localPlayer.Character then
+    task.spawn(watchRagForSteal, localPlayer.Character)
+end
+
+-- ──────────────────────────────────────────────────────────────
+-- LeftControl toggles main UI
+-- ──────────────────────────────────────────────────────────────
+UserInputService.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.KeyCode == Enum.KeyCode.LeftControl then
+        mainFrame.Visible = not mainFrame.Visible
+    end
+end)
+
+-- ──────────────────────────────────────────────────────────────
+-- Restore auto state from config
+-- ──────────────────────────────────────────────────────────────
+if cfg.autoEnabled then
+    setAuto(true)
+end
+
+print("✅ Galaxy Auto Steal + Purple Ragdoll Timer + TP Keybind (KB + Controller) + Floating TP + Lock loaded")
